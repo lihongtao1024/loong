@@ -3319,6 +3319,35 @@ pub(crate) async fn send_text_to_known_session(
     feature = "channel-whatsapp",
     feature = "channel-webhook"
 ))]
+pub async fn process_inbound_with_runtime_and_feedback<R: ConversationRuntime + ?Sized>(
+    config: &LoongConfig,
+    runtime: &R,
+    message: &ChannelInboundMessage,
+    binding: ConversationRuntimeBinding<'_>,
+    feedback_policy: ChannelTurnFeedbackPolicy,
+) -> CliResult<String> {
+    process_inbound_with_runtime_and_feedback_and_error_mode(
+        config,
+        runtime,
+        message,
+        binding,
+        feedback_policy,
+        ProviderErrorMode::Propagate,
+        None,
+    )
+    .await
+}
+
+#[cfg(any(
+    feature = "channel-plugin-bridge",
+    feature = "channel-telegram",
+    feature = "channel-feishu",
+    feature = "channel-line",
+    feature = "channel-matrix",
+    feature = "channel-wecom",
+    feature = "channel-whatsapp",
+    feature = "channel-webhook"
+))]
 pub async fn process_inbound_with_runtime_and_feedback_and_error_mode<
     R: ConversationRuntime + ?Sized,
 >(

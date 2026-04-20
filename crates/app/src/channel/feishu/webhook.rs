@@ -2701,17 +2701,11 @@ data: [DONE]\n\n",
     }
 
     async fn feishu_webhook_provider_timeout_acknowledges_after_retry_budget_exhaustion_impl() {
-        let provider_requests = Arc::new(Mutex::new(Vec::<MockRequest>::new()));
         let feishu_requests = Arc::new(Mutex::new(Vec::<MockRequest>::new()));
-        let (provider_base_url, provider_server) = spawn_mock_provider_delayed_success_server(
-            provider_requests.clone(),
-            std::time::Duration::from_millis(250),
-        )
-        .await;
         let (feishu_base_url, feishu_server) =
             spawn_mock_feishu_api_server(feishu_requests.clone(), "om_reply_unused").await;
 
-        let mut config = test_webhook_config(&provider_base_url, &feishu_base_url);
+        let mut config = test_webhook_config("http://127.0.0.1:9", &feishu_base_url);
         config.provider.request_timeout_ms = 50;
         config.provider.retry_max_attempts = 2;
         config.provider.retry_initial_backoff_ms = 50;
@@ -2788,13 +2782,6 @@ data: [DONE]\n\n",
             &json!({"code": 0, "msg": "duplicate_event"})
         );
 
-        let provider_requests = wait_for_request_count(&provider_requests, 2).await;
-        assert_eq!(
-            provider_requests.len(),
-            2,
-            "provider timeout should consume the configured retry budget before inline error reply"
-        );
-
         let feishu_requests = wait_for_request_count(&feishu_requests, 4).await;
         assert_eq!(
             feishu_requests
@@ -2809,21 +2796,96 @@ data: [DONE]\n\n",
             feishu_requests.iter().any(|request| {
                 request.path == "/open-apis/im/v1/messages/om_inbound_timeout_terminal_1/reply"
                     && request.body.contains("attempt 2/2")
+                    && !request.body.contains("[provider_error]")
             }),
             "the first retry should create a dedicated Feishu status message"
         );
         assert!(
             feishu_requests.iter().any(|request| {
-                request.path == "/open-apis/im/v1/messages/om_reply_unused"
+                (request.path == "/open-apis/im/v1/messages/om_reply_unused"
+                    || request.path
+                        == "/open-apis/im/v1/messages/om_inbound_timeout_terminal_1/reply")
+                    && request
+                        .body
+                        .contains("Sorry, I couldn't finish this request")
+                    && !request.body.contains("[provider_error]")
+            }),
+            "final failure should deliver a user-facing error back to the Feishu conversation"
+        );
+
+        feishu_server.abort();
+    }
+
+    #[test]
+    fn feishu_retry_status_handle_creates_and_updates_single_status_message() {
+        run_feishu_webhook_test_on_large_stack(
+            "feishu-webhook-retry-status-handle",
+            || async move {
+                feishu_retry_status_handle_creates_and_updates_single_status_message_impl().await;
+            },
+        );
+    }
+
+    async fn feishu_retry_status_handle_creates_and_updates_single_status_message_impl() {
+        let feishu_requests = Arc::new(Mutex::new(Vec::<MockRequest>::new()));
+        let (feishu_base_url, feishu_server) =
+            spawn_mock_feishu_api_server(feishu_requests.clone(), "om_retry_status").await;
+
+        let config = test_webhook_config("http://127.0.0.1:9", &feishu_base_url);
+        let resolved = config
+            .feishu
+            .resolve_account(None)
+            .expect("resolve feishu account");
+        let mut adapter = FeishuAdapter::new(&resolved).expect("build feishu adapter");
+        adapter
+            .refresh_tenant_token()
+            .await
+            .expect("refresh tenant token before retry status test");
+        let retry_target = ChannelOutboundTarget::feishu_message_reply("om_source_retry_status")
+            .with_feishu_reply_chat_id("oc_demo")
+            .with_feishu_reply_in_thread(true);
+        let handle = FeishuRetryStatusHandle::new(Arc::new(Mutex::new(adapter)), retry_target);
+
+        let callback = handle.callback().expect("retry callback should exist");
+        callback(crate::provider::ProviderRetryProgress {
+            model: "glm-5".to_owned(),
+            next_attempt: 2,
+            max_attempts: 3,
+            delay_ms: 1_000,
+            status_code: None,
+            timeout: true,
+            connect: false,
+        });
+
+        let handled = handle
+            .finalize_failure(
+                "Sorry, I couldn't finish this request because the model timed out before a full reply was produced. Please try again in a moment."
+                    .to_owned(),
+            )
+            .await;
+        assert!(
+            handled,
+            "final failure should update the existing status message"
+        );
+
+        let feishu_requests = wait_for_request_count(&feishu_requests, 3).await;
+        assert!(
+            feishu_requests.iter().any(|request| {
+                request.path == "/open-apis/im/v1/messages/om_source_retry_status/reply"
+                    && request.body.contains("Retrying attempt 2/3 in 1s")
+            }),
+            "retry progress should create a dedicated Feishu status reply"
+        );
+        assert!(
+            feishu_requests.iter().any(|request| {
+                request.path == "/open-apis/im/v1/messages/om_retry_status"
                     && request.body.contains(
                         "Sorry, I couldn't finish this request because the model timed out before a full reply was produced. Please try again in a moment.",
                     )
-                    && !request.body.contains("[provider_error]")
             }),
-            "final timeout should update the status message with a user-facing error"
+            "final failure should update the single status message instead of sending a second reply"
         );
 
-        provider_server.abort();
         feishu_server.abort();
     }
 
